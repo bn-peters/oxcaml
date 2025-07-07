@@ -853,11 +853,6 @@ module Layout_and_axes = struct
     type t =
       | Ran_out_of_fuel
       | Sufficient_fuel
-
-    let both a b =
-      match a, b with
-      | Ran_out_of_fuel, _ | _, Ran_out_of_fuel -> Ran_out_of_fuel
-      | Sufficient_fuel, Sufficient_fuel -> Sufficient_fuel
   end
 
   (* Normalize the jkind. If mode is [Require_best], only jkinds that have quality [Best]
@@ -979,8 +974,8 @@ module Layout_and_axes = struct
 
         let check
             ({ seen_bounds; fuel_status = _ } as t) ty =
-          Format.printf "@[loop: %a@]@;\n%!"
-            !raw_type_expr ty;
+          Format.printf "@[loop_control: %a size: %d@]@;\n%!"
+            !raw_type_expr ty (List.length seen_bounds);
           let cns = canonize ty in
           match cns with
           | None -> Stop { t with fuel_status = Ran_out_of_fuel }
@@ -993,8 +988,8 @@ module Layout_and_axes = struct
           in
           if subset
             then Skip
-        else
-          Continue { t with seen_bounds = cns @ seen_bounds } 
+          else
+            Continue { t with seen_bounds = cns @ seen_bounds } 
         (* else
           match Types.get_desc ty with
           | Tpoly (ty, _) -> check t ty
@@ -1045,13 +1040,13 @@ module Layout_and_axes = struct
       end in
       let rec loop (ctl : Loop_control.t) bounds_so_far relevant_axes :
           (type_expr * With_bounds_type_info.t) list ->
-          Mod_bounds.t * (l * r2) with_bounds * Fuel_status.t = function
+          Mod_bounds.t * (l * r2) with_bounds * Loop_control.t = function
         (* early cutoff *)
-        | [] -> bounds_so_far, No_with_bounds, ctl.fuel_status
+        | [] -> bounds_so_far, No_with_bounds, ctl
         | _ when Mod_bounds.equal Mod_bounds.max bounds_so_far ->
           (* CR layouts v2.8: we can do better by early-terminating on a per-axis
              basis *)
-          bounds_so_far, No_with_bounds, Sufficient_fuel
+          bounds_so_far, No_with_bounds, Loop_control.starting
         | (ty, ti) :: bs -> (
           (* Map the type's info before expanding the type *)
           let ti =
@@ -1099,7 +1094,7 @@ module Layout_and_axes = struct
                 ~separability:(value_for_axis ~axis:(Nonmodal Separability))
             in
             let found_jkind_for_ty new_ctl b_upper_bounds b_with_bounds quality
-                : Mod_bounds.t * (l * r2) with_bounds * Fuel_status.t =
+                : Mod_bounds.t * (l * r2) with_bounds * Loop_control.t =
               match quality, mode with
               | Best, _ | Not_best, Ignore_best ->
                 (* The relevant axes are the intersection of the relevant axes within our
@@ -1114,7 +1109,7 @@ module Layout_and_axes = struct
                 in
                 (* Descend into the with-bounds of each of our with-bounds types'
                     with-bounds *)
-                let bounds_so_far, nested_with_bounds, fuel_result1 =
+                let bounds_so_far, nested_with_bounds, new_ctl =
                   loop new_ctl bounds_so_far next_relevant_axes
                     (With_bounds.to_list b_with_bounds)
                 in
@@ -1135,12 +1130,13 @@ module Layout_and_axes = struct
 
                    Ideally, this whole problem goes away once we rethink fuel.
                 *)
-                let bounds, bs', fuel_result2 =
+                (* BP: Why are we only joining the parts of the with bounds later? Shouldn't they be normalized together? Or is it because this wouldn't terminate otherwise? *)
+                let bounds, bs', new_ctl =
                   loop new_ctl bounds_so_far relevant_axes bs
                 in
                 ( bounds,
                   With_bounds.join nested_with_bounds bs',
-                  Fuel_status.both fuel_result1 fuel_result2 )
+                  new_ctl)
               | Not_best, Require_best ->
                 (* CR layouts v2.8: The type annotation on the next line is
                    necessary only because [loop] is
@@ -1175,7 +1171,7 @@ module Layout_and_axes = struct
           (Axis_set.complement skip_axes)
           (With_bounds.to_list t.with_bounds)
       in
-      { t with mod_bounds; with_bounds }, fuel_status
+      { t with mod_bounds; with_bounds }, fuel_status.fuel_status
 end
 
 (*********************************)
