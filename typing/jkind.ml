@@ -881,11 +881,9 @@ module Layout_and_axes = struct
          option) (t : (layout, l * r1) layout_and_axes) :
       (layout, l * r2) layout_and_axes * Fuel_status.t =
     (* handle a few common cases first, before doing anything else *)
-    (* DEBUGGING
-       Format.printf "@[normalize: %a@;  relevant_axes: %a@]@;"
-         With_bounds.debug_print t.with_bounds Jkind_axis.Axis_set.print
-         relevant_axes;
-    *)
+    Format.printf "@[normalize: %a@]@;\n%!"
+         With_bounds.debug_print t.with_bounds;
+    
     match t with
     | { with_bounds = No_with_bounds; _ } as t -> t, Sufficient_fuel
     | { with_bounds = With_bounds tys; _ } as t
@@ -897,49 +895,75 @@ module Layout_and_axes = struct
              (Axis_set.complement skip_axes) ->
       { t with with_bounds = No_with_bounds }, Sufficient_fuel
     | _ ->
-      (* Sadly, it seems hard (impossible?) to be sure to expand all types
-         here without using a fuel parameter to stop infinite regress. Here
-         is a nasty case:
-
-         {[
-           type zero
-           type 'n succ
-
-           type 'n loopy = Mk of 'n succ loopy list [@@unboxed]
-         ]}
-
-         First off: this type *is* inhabited, because of the [list] intervening
-         type (which can be empty). It's also inhabited by various circular
-         structures.
-
-         But what's the jkind of ['n loopy]? It must be the jkind of
-         ['n succ loopy list], which is [immutable_data with 'n succ loopy].
-         In order to see if we shouldn't mode-cross, we have to expand the
-         ['n succ loopy] in the jkind, but expanding that just yields the need
-         to expand ['n succ succ loopy], and around we go.
-
-         It seems hard to avoid this problem. And so we use fuel. Yet we want
-         both a small amount of fuel (a type like [type t = K of (t * t) list]
-         gets big very quickly) and a lot of fuel (we can imagine using a unit
-         of fuel for each level of a deeply nested record structure). The
-         compromise is to track fuel per type head, where a type head is either
-         the path to a type constructor (like [t] or [loopy]) or a tuple.
-         (We need to include tuples because of the possibility of recursive
-         types and the fact that tuples track their element types in their
-         jkind's with_bounds.)
-
-         The initial fuel per type head is 10, as it seems hard to imagine that
-         we're going to make meaningful progress if we've seen the same type
-         head 10 times in one line of recursive descent. (This "one line of
-         recursive descent" bit is why we recur separately down one type before
-         iterating down the list.)
-      *)
       (* CR reisenberg: document seen_args *)
       let module Loop_control = struct
+        type canon =
+          (* | Concrete of
+              { mod_bounds : Mod_bounds.t;
+                with_bounds : (canon * With_bounds_type_info.t) list
+              } *)
+          | Abstract of
+              { path : Path.t;
+                argi : int;
+                arg : canon;
+              }
+          | Var of type_expr
+        let rec option_list_option (f : 'a option list) =
+          match f with
+          | [] -> Some []
+          | None :: _ -> None
+          | Some x :: xs -> (
+            match option_list_option xs with
+            | None -> None
+            | Some ys -> Some (x :: ys))
+        let rec canonize ty : canon list option =    
+          match Types.get_desc ty with
+          (* TODO Does this make any sense? *)
+          | Tpoly (ty, _) -> canonize ty
+          | Ttuple tys ->
+              Some (List.flatten @@ List.filter_map (fun (_, ty) -> canonize ty) tys)
+          | Tconstr (p, args, _) ->
+            Option.map List.flatten @@ option_list_option @@ 
+              List.mapi (fun i ty -> Option.map (fun cns -> List.map (fun cn -> Abstract { path = p; argi = i; arg = cn}) cns) (canonize ty)) args
+          (* TODO handle row variables *)
+          | Tvariant _ -> None
+          | Tvar _ | Tarrow _ | Tunboxed_tuple _ | Tobject _ | Tfield _ | Tnil
+          | Tunivar _ | Tpackage _ | Tof_kind _ ->
+            (* these cases either cannot be infinitely recursive or their jkinds
+               do not have with_bounds *)
+            (* CR layouts v2.8: Some of these might get with-bounds someday. We
+               should double-check before we're done that they haven't. *)
+            Some ([Var ty])
+          | Tlink _ | Tsubst _ ->
+            Misc.fatal_error "Tlink or Tsubst in normalize"
+        let reduce cn : canon =
+          let rec loop cn seen_paths =
+            match cn with
+            | Abstract { path; argi; arg } ->
+              if List.exists (fun (path_, i) -> Path.same path path_ && i == argi) seen_paths
+              then loop arg seen_paths
+              else
+                Abstract { path; argi; arg = loop arg ((path, argi) :: seen_paths) }
+            | Var ty -> Var ty
+          in
+            loop cn []
+
+        (* TODO generalize to an order for deduplication *)
+        let rec canon_eq cn1 cn2 =
+          match cn1, cn2 with
+          (* | Concrete { mod_bounds = mb1; with_bounds = wb1 },
+            Concrete { mod_bounds = mb2; with_bounds = wb2 } ->
+            Mod_bounds.equal mb1 mb2 && List.equal (fun (c1, _) (c2, _) -> canon_eq c1 c2) wb1 wb2 *)
+          | Abstract { path = p1; argi = i1; arg = a1 },
+            Abstract { path = p2; argi = i2; arg = a2 } ->
+            Path.same p1 p2 && i1 = i2 && canon_eq a1 a2
+          | Var ty1, Var ty2 ->
+            TransientTypeOps.equal (Transient_expr.repr ty1) (Transient_expr.repr ty2)
+          | _ -> false
         type t =
-          { tuple_fuel : int;
-            constr : (int * type_expr list) Path.Map.t;
-            seen_row_var : Numbers.Int.Set.t;
+        (* TODO deduplicate seen_bounds for performance *)
+          { seen_bounds : canon list;
+            (* seen_row_var : Numbers.Int.Set.t; *)
             fuel_status : Fuel_status.t
           }
 
@@ -948,17 +972,30 @@ module Layout_and_axes = struct
           | Skip (* skip reducing this type, but otherwise continue *)
           | Continue of t (* continue, with a new [t] *)
 
-        let initial_fuel_per_ty = 2
-
         let starting =
-          { tuple_fuel = initial_fuel_per_ty;
-            constr = Path.Map.empty;
-            seen_row_var = Numbers.Int.Set.empty;
+          { seen_bounds = [];
             fuel_status = Sufficient_fuel
           }
 
-        let rec check
-            ({ tuple_fuel; constr; seen_row_var; fuel_status = _ } as t) ty =
+        let check
+            ({ seen_bounds; fuel_status = _ } as t) ty =
+          Format.printf "@[loop: %a@]@;\n%!"
+            !raw_type_expr ty;
+          let cns = canonize ty in
+          match cns with
+          | None -> Stop { t with fuel_status = Ran_out_of_fuel }
+          | Some cns ->
+          let cns =
+            List.map reduce cns
+          in
+          let subset =
+            List.for_all (fun cn1 -> List.exists (fun cn2 -> canon_eq cn1 cn2) seen_bounds) cns
+          in
+          if subset
+            then Skip
+        else
+          Continue { t with seen_bounds = cns @ seen_bounds } 
+        (* else
           match Types.get_desc ty with
           | Tpoly (ty, _) -> check t ty
           | Ttuple _ ->
@@ -1004,7 +1041,7 @@ module Layout_and_axes = struct
                should double-check before we're done that they haven't. *)
             Continue t
           | Tlink _ | Tsubst _ ->
-            Misc.fatal_error "Tlink or Tsubst in normalize"
+            Misc.fatal_error "Tlink or Tsubst in normalize" *)
       end in
       let rec loop (ctl : Loop_control.t) bounds_so_far relevant_axes :
           (type_expr * With_bounds_type_info.t) list ->
