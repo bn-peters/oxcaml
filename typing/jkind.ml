@@ -932,7 +932,7 @@ module Layout_and_axes = struct
           (* We might be tracking this because we sometimes simplify, and want to remember which ones
              we've expanded already. However, I'm not sure about the rules for simplification yet*)
           (* TODO find better names? seen_paths? *)
-          expanded_paths : PathI.Set.t;
+          seen_paths : PathI.Set.t;
           paths : PathI.Set.t
         }
 
@@ -953,7 +953,7 @@ module Layout_and_axes = struct
           clauses =
             { mod_bounds = t.mod_bounds;
               arg = Nothing;
-              expanded_paths = PathI.Set.empty;
+              seen_paths = PathI.Set.empty;
               paths = PathI.Set.empty
             }
             :: List.map
@@ -961,7 +961,7 @@ module Layout_and_axes = struct
                    { (* TODO this probably shouldn't be an axis set, but a mod bound? *)
                      mod_bounds = axis_set_to_mod_bounds info.relevant_axes;
                      arg = Type ty;
-                     expanded_paths = PathI.Set.empty;
+                     seen_paths = PathI.Set.empty;
                      paths = PathI.Set.empty
                    })
                  (With_bounds.to_list t.with_bounds)
@@ -983,8 +983,8 @@ module Layout_and_axes = struct
             { mod_bounds = Mod_bounds.meet cl.mod_bounds cl_.mod_bounds;
               arg = cl_.arg;
               (* TODO make sure union is the right operation here *)
-              expanded_paths =
-                PathI.Set.union cl.expanded_paths cl_.expanded_paths;
+              seen_paths =
+                PathI.Set.union cl.seen_paths cl_.seen_paths;
               paths = PathI.Set.union cl.paths cl_.paths
             })
           cls.clauses
@@ -1010,7 +1010,7 @@ module Layout_and_axes = struct
             List.map
               (fun cl ->
                 { cl with
-                  expanded_paths = pathi_set_add_option path cl.expanded_paths
+                  seen_paths = pathi_set_add_option path cl.seen_paths
                 })
               new_clauses
           | Not_best, Require_best ->
@@ -1030,7 +1030,7 @@ module Layout_and_axes = struct
             List.flatten
               (List.mapi
                  (fun arg ty ->
-                   if PathI.Set.mem { path; arg } cl.expanded_paths
+                   if PathI.Set.mem { path; arg } cl.seen_paths
                    then [{ cl with arg = Type ty }]
                    else expand_clause_ty cl ty (Some { path; arg }))
                  tys)
