@@ -874,7 +874,7 @@ module Layout_and_axes = struct
      of this function for these axes is undefined; do *not* look at the results for these
      axes.
   *)
-  let normalize (type layout l r1 r2) ~jkind_of_type ~(mode : r2 normalize_mode)
+  let normalize (type layout l r1 r2) ~(jkind_of_type : type_expr -> ('a * disallowed) jkind option) ~(mode : r2 normalize_mode)
       ~skip_axes
       ?(map_type_info :
          (type_expr -> With_bounds_type_info.t -> With_bounds_type_info.t)
@@ -886,7 +886,171 @@ module Layout_and_axes = struct
          With_bounds.debug_print t.with_bounds Jkind_axis.Axis_set.print
          relevant_axes;
     *)
+    let module Foo = struct
+      module PathI = struct
+        type t = {
+          path : Path.t;
+          arg : int;
+          (* num_args : int; *)
+        }
+        (* ignore num_args for deduplication; it should be unique per path *)
+        let compare p1 p2 =
+          let compare_num = Int.compare p1.arg p2.arg in
+          if compare_num <> 0 then compare_num
+          else Path.compare p1.path p2.path
+
+        module List = struct
+          module T = struct
+            type nonrec t = t list
+            let compare = List.compare compare
+          end
+          module Map = Map.Make(T)
+        end
+        module T = struct
+          type nonrec t = t
+          let compare = compare
+        end
+        module Map = Map.Make(T)
+        module Set = Set.Make(T)
+      end
+      type clause_argument = 
+      | Type of type_expr
+      | Var of type_expr
+      | PathMod of PathI.t
+      | Nothing
+
+      type clause = {
+        mod_bounds : Mod_bounds.t;
+        arg : clause_argument;
+        (* TODO why are we tracking this separately? Won't this be a superset of paths anyway? *)
+        (* We might be tracking this because we sometimes simplify, and want to remember which ones 
+        we've expanded already. However, I'm not sure about the rules for simplification yet*)
+        expanded_paths : PathI.Set.t;
+        paths : PathI.Set.t;
+      }
+      type 'layout clauses = {
+        layout : 'layout;
+        (* TODO it's not obvious to me what the right representation of clauses would be. 
+           There's lots of operations we'd like to do efficiently; this doesn't help with any of them... *)
+        clauses : clause list;
+      }
+
+      let axis_set_to_mod_bounds (s : Axis_set.t) : Mod_bounds.t =
+        (* TODO implement *)
+        Obj.magic s
+
+
+      let layout_and_axes_to_clauses (t : ('layout, 'l * 'r) layout_and_axes) : 'layout clauses =
+        {
+          layout = t.layout;
+          clauses = 
+          {
+            mod_bounds = t.mod_bounds;
+            arg = Nothing;
+            expanded_paths = PathI.Set.empty;
+            paths = PathI.Set.empty;
+          } ::
+          List.map (fun (ty, info : _ * With_bounds_type_info.t) -> {
+            (* TODO this probably shouldn't be an axis set, but a mod bound? *) 
+            mod_bounds = axis_set_to_mod_bounds info.relevant_axes;
+            arg = Type ty;
+            expanded_paths = PathI.Set.empty;
+            paths = PathI.Set.empty;
+          }) (With_bounds.to_list t.with_bounds)
+        }
+
+      let clauses_join c1 c2 = {
+        (* TODO layout is treated as a dummy value here. is that okay? *)
+        layout = c1.layout;
+        clauses = c1.clauses @ c2.clauses;
+      }
+
+      (* TODO better explanation *)
+      (* takes a clause and a list of clauses. The list of clauses should come from expanding 
+         the Type `arg` of cl. Inlines the list of clauses into cl. ignores the layout in clauses. *)
+      let clause_inline_clauses (cl : clause) (cls : 'layout clauses) : clause list =
+        List.map (fun (cl_ : clause) -> {
+          mod_bounds = Mod_bounds.meet cl.mod_bounds cl_.mod_bounds;
+          arg = cl_.arg;
+          (* TODO make sure union is the right operation here *)
+          expanded_paths = PathI.Set.union cl.expanded_paths cl_.expanded_paths;
+          paths = PathI.Set.union cl.paths cl_.paths 
+        }) cls.clauses
+
+
+      let extract_head_path (ty : type_expr) : (Path.t * type_expr list) option =
+        match Types.get_desc ty with
+        | Tconstr (p, tys, _) -> Some (p, tys)
+        | _ -> None
+
+      let pathi_set_add_option (path : PathI.t option) (s : PathI.Set.t) =
+        match path with
+        | Some path -> PathI.Set.add path s
+        | None -> s
+
+      let expand_clause_ty (cl : clause) (ty : type_expr) (path : PathI.t option) : clause list =
+        match jkind_of_type ty with
+        | Some jkind ->
+          begin match jkind.quality, mode with
+          | Best, _ | Not_best, Ignore_best ->
+            let new_clauses = clause_inline_clauses cl (layout_and_axes_to_clauses jkind.jkind) in
+            List.map (fun cl ->
+              {
+                cl with expanded_paths = pathi_set_add_option path cl.expanded_paths
+              }) new_clauses
+          | Not_best, Require_best ->
+            (* TODO what to do in this case? *)
+            []
+          end
+        | None ->
+          (* TODO what to do in this case? *)
+          []
+  
+
+
+      let expand_clause (cl : clause) : clause list = 
+        match cl.arg with
+        | Type ty -> 
+          begin match extract_head_path ty with
+          | Some (path, tys) -> 
+            List.flatten (List.mapi (fun arg ty ->
+              if PathI.Set.mem { path; arg } cl.expanded_paths then
+                [{ cl with arg = Type ty }]
+              else
+                expand_clause_ty cl ty (Some { path; arg })
+            ) tys)
+          | None -> expand_clause_ty cl ty None
+          end
+        | _ -> [cl]
+
+(* 
+      let with_bound_to_na ((t, ti) : type_expr * With_bounds_type_info.t) :
+          normalized_axes =
+        (* TODO use canonical algorithm from previous approach *)
+        []
+      let with_bounds_to_na (wb : ('a * 'b) with_bounds) : normalized_axes =
+        match wb with
+        | No_with_bounds -> []
+        | With_bounds tys -> List.concat_map with_bound_to_na (tys |> With_bounds_types.to_seq |> List.of_seq)
+      let jkind_to_na (t : (layout, 'a * 'b) layout_and_axes) : normalized_axes =
+        { mod_bound = t.mod_bounds;
+          argument = None;
+          paths = [];
+        } :: with_bounds_to_na t.with_bounds
+
+      let simplify_na (na : normalized_axes) : normalized_axes =
+        []
+
+      let na_to_with_bounds (na : normalized_axes) : Mod_bounds.t * (l * r2) With_bounds.t =
+        Obj.magic 0 *)
+    end in
     match t with
+    | { with_bounds = No_with_bounds; _ } -> 
+      (* there's nothing to normalize if there's no with-bounds *)
+      { t with with_bounds = No_with_bounds }, Sufficient_fuel
+    | _ ->
+      { t with with_bounds = No_with_bounds }, Sufficient_fuel
+    (* match t with
     | { with_bounds = No_with_bounds; _ } as t -> t, Sufficient_fuel
     | { with_bounds = With_bounds tys; _ } as t
       when Axis_set.equal skip_axes Axis_set.all
@@ -1138,7 +1302,7 @@ module Layout_and_axes = struct
           (Axis_set.complement skip_axes)
           (With_bounds.to_list t.with_bounds)
       in
-      { t with mod_bounds; with_bounds }, fuel_status
+      { t with mod_bounds; with_bounds }, fuel_status *)
 end
 
 (*********************************)
@@ -4026,3 +4190,4 @@ let () =
   Location.register_error_of_exn (function
     | Error.User_error (loc, err) -> Some (report_error ~loc err)
     | _ -> None)
+
