@@ -922,7 +922,7 @@ module Layout_and_axes = struct
       type clause_argument =
         | Type of type_expr
         | Var of type_expr
-        | PathMod of PathI.t
+        | PathMod of Path.t
         | Nothing
 
       type clause =
@@ -931,6 +931,7 @@ module Layout_and_axes = struct
           (* TODO why are we tracking this separately? Won't this be a superset of paths anyway? *)
           (* We might be tracking this because we sometimes simplify, and want to remember which ones
              we've expanded already. However, I'm not sure about the rules for simplification yet*)
+          (* TODO find better names? seen_paths? *)
           expanded_paths : PathI.Set.t;
           paths : PathI.Set.t
         }
@@ -1019,6 +1020,8 @@ module Layout_and_axes = struct
           (* TODO what to do in this case? *)
           []
 
+      (* TODO how to detect whether this did anything? some trivial cases are trivial, but what if
+         expanding kinds did nothing? *)
       let expand_clause (cl : clause) : clause list =
         match cl.arg with
         | Type ty -> (
